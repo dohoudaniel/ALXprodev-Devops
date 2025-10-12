@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# fetch_pikachu.sh
+# Fetch Pikachu data from the PokéAPI and save to data.json.
+# On failure, append useful information to errors.txt.
+
+set -o pipefail
+# we will temporarily disable -e around curl so we can inspect curl exit/code
+# but keep strict handling otherwise
+# (do not use `set -e` here because we want to handle curl failures gracefully)
+
+URL="https://pokeapi.co/api/v2/pokemon/pikachu"
+OUT="data.json"
+TMP="${OUT}.tmp"
+ERR="errors.txt"
+CURL_ERR="${TMP}.curlerr"
+
+cleanup() {
+  rm -f "$TMP" "$CURL_ERR"
+}
+trap cleanup EXIT
+
+timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+# perform request capturing HTTP status and stderr
+# -sS : silent but show errors to stderr
+# -w "%{http_code}" : output HTTP code to stdout
+# -o <file> : save body to file
+http_code=""
+curl_exit=0
+
+# run curl without exiting script on non-zero
+http_code=$(curl -sS -w "%{http_code}" -o "$TMP" "$URL" 2> "$CURL_ERR") || curl_exit=$?
+
+# handle curl failure (network, DNS, etc.)
+if [ "$curl_exit" -ne 0 ]; then
+  {
+    printf '%s ERROR CURL_EXIT=%s URL=%s\n' "$(timestamp)" "$curl_exit" "$URL"
+    printf 'curl stderr:\n'
+    sed -n '1,200p' "$CURL_ERR"
+    printf '\n'
+  } >> "$ERR"
+  echo "Request failed (curl error). See $ERR"
+  exit 1
+fi
+
+# check http status
+# treat 2xx as success
+if [ -n "$http_code" ] && [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+  # move tmp into place atomically
+  mv -f "$TMP" "$OUT"
+  rm -f "$CURL_ERR"
+  echo "Saved response to $OUT (HTTP $http_code)"
+  exit 0
+fi
+
+# non-2xx -> record error with helpful context, including first part of body and curl stderr
+{
+  printf '%s ERROR HTTP_CODE=%s URL=%s\n' "$(timestamp)" "$http_code" "$URL"
+  printf 'curl stderr (if any):\n'
+  sed -n '1,200p' "$CURL_ERR"
+  printf '\nresponse body (first 1000 bytes):\n'
+  if [ -f "$TMP" ]; then
+    head -c 1000 "$TMP" || true
+    printf '\n'
+  else
+    printf '(no body)\n'
+  fi
+  printf '\n----\n'
+} >> "$ERR"
+
+# remove possibly incomplete tmp file
+rm -f "$TMP"
+echo "Request returned HTTP $http_code. See $ERR for details."
+exit 1
+
