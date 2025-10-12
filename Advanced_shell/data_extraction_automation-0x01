@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# parse_pikachu
+# Extract name, height, weight and type(s) from data.json and print a human-readable sentence.
+# Uses only: jq, awk (and shell builtins for minimal file checks).
+
+set -euo pipefail
+
+JSON_FILE="data.json"
+
+if [ ! -f "$JSON_FILE" ]; then
+  echo "Error: $JSON_FILE not found" >&2
+  exit 1
+fi
+
+# Produce a TSV line: name<TAB>height<TAB>weight<TAB>types_joined_by_slash
+# types are joined with "/" (e.g. "electric" or "electric/flying")
+jq -r '[.name, (.height|tostring), (.weight|tostring), (.types | map(.type.name) | join("/"))] | @tsv' "$JSON_FILE" \
+| awk -F'\t' '
+{
+  name=$1; height_dm=$2; weight_hg=$3; types_raw=$4;
+
+  # Capitalize first letter of the Pokemon name
+  name = toupper(substr(name,1,1)) substr(name,2);
+
+  # Split types (joined with "/") into array and capitalize each type
+  n = split(types_raw, arr, "/");
+  for (i=1; i<=n; i++) {
+    # capitalize first letter of each type
+    arr[i] = toupper(substr(arr[i],1,1)) substr(arr[i],2);
+  }
+
+  # Join types into human-friendly form:
+  # - 1 type: "Electric"
+  # - 2 types: "Fire and Flying"
+  # - >2 types: "Type1, Type2, and TypeN"
+  typ = "";
+  if (n == 1) {
+    typ = arr[1];
+  } else if (n == 2) {
+    typ = arr[1] " and " arr[2];
+  } else {
+    for (i = 1; i <= n; i++) {
+      if (i == n) {
+        typ = typ "and " arr[i];
+      } else {
+        typ = typ arr[i] ", ";
+      }
+    }
+  }
+
+  # Convert units: height is in decimeters -> meters; weight is in hectograms -> kilograms
+  height_m = height_dm / 10;
+  weight_kg = weight_hg / 10;
+
+  # Format: weight without decimal if whole number, otherwise one decimal
+  if (weight_kg == int(weight_kg)) {
+    weight_fmt = sprintf("%.0fkg", weight_kg);
+  } else {
+    weight_fmt = sprintf("%.1fkg", weight_kg);
+  }
+
+  # Format height with one decimal (e.g., 0.4m)
+  height_fmt = sprintf("%.1fm", height_m);
+
+  # Final sentence
+  printf "%s is of type %s, weighs %s, and is %s tall.\n", name, typ, weight_fmt, height_fmt;
+}
+'
+
