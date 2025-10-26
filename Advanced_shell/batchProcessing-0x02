@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# fetch_multiple_pokemon
+# Fetch a fixed list of Pokemon and save each response to pokemon_data/<name>.json
+# Handles simple retries, logs errors to errors.txt, and respects a delay between requests.
+
+set -o pipefail
+# don't set -e so we can continue on individual failures but exit on unexpected errors
+# script-level failures will be handled per-request
+
+API_BASE="https://pokeapi.co/api/v2/pokemon"
+DEST_DIR="pokemon_data"
+ERR_FILE="errors.txt"
+DELAY="${DELAY:-1}"         # seconds between requests (can override with env var)
+MAX_RETRIES=3
+INITIAL_BACKOFF=1
+
+mkdir -p "${DEST_DIR}"
+
+timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+log_err() {
+  # append timestamped message and optional curl stderr/body excerpt to errors.txt
+  echo "[$(timestamp)] $*" >> "${ERR_FILE}"
+}
+
+fetch_pokemon() {
+  local name="$1"
+  local url="${API_BASE}/${name}"
+  local outfile="${DEST_DIR}/${name}.json"
+  local tmpfile="${outfile}.tmp"
+  local curlerr="${tmpfile}.curlerr"
+
+  # Try up to MAX_RETRIES with exponential backoff
+  local attempt=0
+  local backoff="${INITIAL_BACKOFF}"
+  while :; do
+    attempt=$((attempt + 1))
+    # use curl to save body to tmpfile and print HTTP code (quiet progress)
+    http_code=$(curl -sS -w "%{http_code}" -o "${tmpfile}" "${url}" 2> "${curlerr}") || curl_exit=$?
+    curl_exit=${curl_exit:-0}
+
+    if [ "${curl_exit}" -ne 0 ]; then
+      log_err "REQUEST ERROR ${name} attempt=${attempt} curl_exit=${curl_exit} url=${url}"
+      # append curl stderr
+      if [ -s "${curlerr}" ]; then
+        sed -n '1,200p' "${curlerr}" >> "${ERR_FILE}"
+      fi
+    else
+      # check HTTP code
+      if [[ "${http_code}" =~ ^2[0-9][0-9]$ ]]; then
+        # success: move tmp to final
+        mv -f "${tmpfile}" "${outfile}"
+        rm -f "${curlerr}"
+        echo "Saved data to ${outfile} ✅"
+        return 0
+      else
+        # non-2xx
+        log_err "HTTP ERROR ${name} attempt=${attempt} code=${http_code} url=${url}"
+        # save first part of response body for debug
+        if [ -s "${tmpfile}" ]; then
+          echo "---- response body (first 1024 bytes) ----" >> "${ERR_FILE}"
+          head -c 1024 "${tmpfile}" >> "${ERR_FILE"
+          echo -e "\n----------------------------------------" >> "${ERR_FILE}"
+        fi
+      fi
+    fi
+
+    # If we've exhausted attempts, record and exit with failure for this name
+    if [ "${attempt}" -ge "${MAX_RETRIES}" ]; then
+      log_err "FAILED to fetch ${name} after ${attempt} attempts."
+      rm -f "${tmpfile}" "${curlerr}"
+      echo "Failed to fetch ${name}. See ${ERR_FILE} for details."
+      return 1
+    fi
+
+    # Wait then retry with exponential backoff
+    sleep "${backoff}"
+    backoff=$(( backoff * 2 ))
+  done
+}
+
+# The exact list required by the task (note: lowercased for file names and API endpoint)
+POKEMON_LIST=(Bulbasaur Ivysaur Venusaur Charmander Charmeleon)
+
+for p in "${POKEMON_LIST[@]}"; do
+  # normalize name to lowercase for filenames and API
+  name_lc=$(echo "$p" | tr '[:upper:]' '[:lower:]')
+  echo "Fetching data for ${name_lc}..."
+  fetch_pokemon "${name_lc}"
+  # throttle between requests to avoid rate limits
+  sleep "${DELAY}"
+done
+
+echo "Done."
+
