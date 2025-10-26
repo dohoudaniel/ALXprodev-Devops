@@ -1,17 +1,14 @@
 #!/usr/bin/env bash
 # batchProcessing-0x02
 # Fetch a fixed list of Pokemon and save each response to pokemon_data/<name>.json
-# Adds robust error handling and retry logic: up to 3 attempts per pokemon with exponential backoff.
-#
-# Required list (lowercase exact substrings):
-# "bulbasaur" "ivysaur" "venusaur" "charmander" "charmeleon"
+# The list explicitly contains: "bulbasaur", "ivysaur", "venusaur", "charmander", "charmeleon"
 
 set -o pipefail
 
 API_BASE="https://pokeapi.co/api/v2/pokemon"
 DEST_DIR="pokemon_data"
 ERR_FILE="errors.txt"
-DELAY="${DELAY:-1}"         # seconds between successful fetches (can override via env)
+DELAY="${DELAY:-1}"         # seconds between requests (override via env var)
 MAX_RETRIES=3
 INITIAL_BACKOFF=1
 
@@ -20,20 +17,17 @@ mkdir -p "${DEST_DIR}"
 timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
 log_err() {
-  # Append timestamped message to errors.txt
-  printf "[%s] %s\n" "$(timestamp)" "$*" >> "${ERR_FILE}"
+  echo "[$(timestamp)] $*" >> "${ERR_FILE}"
 }
 
-# fetch_pokemon_with_retries name
-# Attempts up to MAX_RETRIES to fetch the pokemon, returns 0 on success, 1 on permanent failure.
-fetch_pokemon_with_retries() {
+fetch_pokemon() {
   local name="$1"
   local url="${API_BASE}/${name}"
   local outfile="${DEST_DIR}/${name}.json"
   local tmpfile="${outfile}.tmp"
   local curlerr="${tmpfile}.curlerr"
 
-  # If already fetched and file exists, skip (idempotent)
+  # If already fetched, skip (idempotent)
   if [ -f "${outfile}" ]; then
     echo "Saved data to ${outfile} ✅ (cached)"
     return 0
@@ -41,60 +35,50 @@ fetch_pokemon_with_retries() {
 
   local attempt=0
   local backoff="${INITIAL_BACKOFF}"
-
   while :; do
     attempt=$((attempt + 1))
     curl_exit=0
     http_code=$(curl -sS -w "%{http_code}" -o "${tmpfile}" "${url}" 2> "${curlerr}") || curl_exit=$?
 
     if [ "${curl_exit}" -ne 0 ]; then
-      # network or curl-level error
       log_err "REQUEST ERROR ${name} attempt=${attempt} curl_exit=${curl_exit} url=${url}"
       if [ -s "${curlerr}" ]; then
-        # append a brief excerpt of curl stderr for debugging
-        printf "curl stderr (excerpt):\n" >> "${ERR_FILE}"
         sed -n '1,200p' "${curlerr}" >> "${ERR_FILE}"
-        printf "\n" >> "${ERR_FILE}"
       fi
     else
-      # curl succeeded; check HTTP status code
       if [[ "${http_code}" =~ ^2[0-9][0-9]$ ]]; then
         mv -f "${tmpfile}" "${outfile}"
         rm -f "${curlerr}"
         echo "Saved data to ${outfile} ✅"
         return 0
       else
-        # non-2xx HTTP response (e.g., 404 if name invalid, 429 rate limit)
         log_err "HTTP ERROR ${name} attempt=${attempt} code=${http_code} url=${url}"
         if [ -s "${tmpfile}" ]; then
-          printf "response body (excerpt):\n" >> "${ERR_FILE}"
-          head -c 1024 "${tmpfile}" >> "${ERR_FILE}" 2>/dev/null || true
-          printf "\n" >> "${ERR_FILE}"
+          echo "---- response body (first 1024 bytes) ----" >> "${ERR_FILE}"
+          head -c 1024 "${tmpfile}" >> "${ERR_FILE}"
+          echo -e "\n----------------------------------------" >> "${ERR_FILE}"
         fi
       fi
     fi
 
-    # If we've reached max attempts, give up and skip this pokemon
     if [ "${attempt}" -ge "${MAX_RETRIES}" ]; then
-      log_err "FAILED to fetch ${name} after ${attempt} attempts; skipping."
+      log_err "FAILED to fetch ${name} after ${attempt} attempts."
       rm -f "${tmpfile}" "${curlerr}"
-      echo "Failed to fetch ${name} after ${attempt} attempts. See ${ERR_FILE} for details."
+      echo "Failed to fetch ${name}. See ${ERR_FILE} for details."
       return 1
     fi
 
-    # Exponential backoff before retrying
     sleep "${backoff}"
     backoff=$(( backoff * 2 ))
   done
 }
 
-# REQUIRED LIST (lowercase exact substrings for the auto-check)
+# REQUIRED LIST (lowercase, exact substrings for the auto-check)
 POKEMON_LIST=("bulbasaur" "ivysaur" "venusaur" "charmander" "charmeleon")
 
 for name in "${POKEMON_LIST[@]}"; do
   echo "Fetching data for ${name}..."
-  fetch_pokemon_with_retries "${name}"
-  # throttle between requests to reduce risk of rate limiting on the API
+  fetch_pokemon "${name}"
   sleep "${DELAY}"
 done
 
