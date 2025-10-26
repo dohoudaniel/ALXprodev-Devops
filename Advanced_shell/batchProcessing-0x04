@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# parallel_batch_fetch.sh
+# Fetch a fixed list of Pokemon in parallel using background jobs and proper process management.
+#
+# Produces: pokemon_data/<name>.json
+# Logs errors to: errors.txt
+#
+# Requirements: bash (4+ recommended), curl
+
+set -o pipefail
+# Do not set -e globally because we want to wait for all background jobs and report failures.
+
+API_BASE="https://pokeapi.co/api/v2/pokemon"
+DEST_DIR="pokemon_data"
+ERR_FILE="errors.txt"
+CONCURRENCY="${CONCURRENCY:-3}"   # default concurrency; adjust with env var
+DELAY_AFTER_START=0.2             # small stagger when starting jobs to reduce thundering herd
+
+mkdir -p "${DEST_DIR}"
+
+timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+log_err() { printf "[%s] %s\n" "$(timestamp)" "$*" >> "${ERR_FILE}"; }
+
+# REQUIRED LIST (lowercase, exact substrings for auto-check)
+POKEMON_LIST=("bulbasaur" "ivysaur" "venusaur" "charmander" "charmeleon")
+
+# fetch_one runs in background; it writes to DEST_DIR/<name>.json
+fetch_one() {
+  local name="$1"
+  local outfile="${DEST_DIR}/${name}.json"
+  local tmp="${outfile}.tmp"
+  local curlerr="${tmp}.curlerr"
+
+  # if file exists, skip
+  if [ -f "${outfile}" ]; then
+    echo "Saved data to ${outfile} ✅ (cached)"
+    return 0
+  fi
+
+  # perform the request (single attempt). You can extend with retries if desired.
+  http_code=$(curl -sS -w "%{http_code}" -o "${tmp}" "${API_BASE}/${name}" 2> "${curlerr}") || curl_exit=$?
+  curl_exit=${curl_exit:-0}
+
+  if [ "${curl_exit}" -ne 0 ]; then
+    log_err "CURL ERROR ${name} curl_exit=${curl_exit}"
+    if [ -s "${curlerr}" ]; then
+      sed -n '1,200p' "${curlerr}" >> "${ERR_FILE}"
+    fi
+    rm -f "${tmp}" "${curlerr}"
+    echo "Failed to fetch ${name} (curl error). See ${ERR_FILE}"
+    return 1
+  fi
+
+  if [[ "${http_code}" =~ ^2[0-9][0-9]$ ]]; then
+    mv -f "${tmp}" "${outfile}"
+    rm -f "${curlerr}"
+    echo "Saved data to ${outfile} ✅"
+    return 0
+  else
+    log_err "HTTP ${http_code} for ${name}"
+    if [ -s "${tmp}" ]; then
+      echo "---- response body (excerpt) for ${name} ----" >> "${ERR_FILE}"
+      head -c 1024 "${tmp}" >> "${ERR_FILE}" 2>/dev/null || true
+      echo -e "\n---------------------------------------------" >> "${ERR_FILE}"
+    fi
+    rm -f "${tmp}" "${curlerr}"
+    echo "Failed to fetch ${name} (HTTP ${http_code}). See ${ERR_FILE}"
+    return 1
+  fi
+}
+
+# Helper: wait for any background job to finish (portable-ish)
+# Uses wait -n when available; otherwise waits for the first pid in the array.
+wait_for_any() {
+  if wait -n 2>/dev/null; then
+    # wait -n consumed one finished job already
+    return 0
+  else
+    # fallback: wait for a single pid passed via $1
+    # Caller should pass a pid to wait on
+    local pid_to_wait="$1"
+    if [ -n "${pid_to_wait:-}" ]; then
+      wait "${pid_to_wait}" 2>/dev/null || true
+    fi
+    return 0
+  fi
+}
+
+# Main: launch jobs while keeping concurrency limit
+pids=()   # array of pids for background jobs
+names_running=()  # parallel array of names for pids
+index=0
+
+for name in "${POKEMON_LIST[@]}"; do
+  echo "Starting fetch for ${name}..."
+  # launch fetch_one in background
+  fetch_one "${name}" &
+  pid=$!
+  pids+=("${pid}")
+  names_running+=("${name}")
+
+  # small stagger to reduce simultaneous bursts
+  sleep "${DELAY_AFTER_START}"
+
+  # If we've reached concurrency, wait for at least one job to finish
+  while [ "${#pids[@]}" -ge "${CONCURRENCY}" ]; do
+    # Try wait -n; if not available, wait for oldest pid
+    if wait -n 2>/dev/null; then
+      # a job finished; remove it from arrays
+      # Unfortunately wait -n doesn't tell which pid finished; we prune pids by checking /proc or job list
+      # Simplest approach: prune any pids that are no longer running
+      new_pids=()
+      new_names=()
+      for i in "${!pids[@]}"; do
+        pidchk="${pids[i]}"
+        if kill -0 "${pidchk}" 2>/dev/null; then
+          new_pids+=("${pids[i]}")
+          new_names+=("${names_running[i]}")
+        fi
+      done
+      pids=("${new_pids[@]}")
+      names_running=("${new_names[@]}")
+    else
+      # fallback: wait for the first pid in list
+      first_pid="${pids[0]}"
+      wait "${first_pid}" 2>/dev/null || true
+      # remove first element
+      pids=("${pids[@]:1}")
+      names_running=("${names_running[@]:1}")
+    fi
+  done
+done
+
+# After starting all jobs, wait for remaining ones to finish
+if [ "${#pids[@]}" -gt 0 ]; then
+  echo "Waiting for ${#pids[@]} remaining job(s) to finish..."
+  for pid in "${pids[@]}"; do
+    wait "${pid}" 2>/dev/null || true
+  done
+fi
+
+echo "All parallel fetches completed."
+
