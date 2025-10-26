@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# pokemon_report
+# Read pokemon_data/*.json, extract name/height/weight, produce pokemon_report.csv,
+# print CSV content, and compute averages using awk.
+#
+# Requirements: bash, jq, awk, sed (jq required to parse JSON).
+
+set -euo pipefail
+
+DATA_DIR="pokemon_data"
+OUT="pokemon_report.csv"
+
+# Ensure jq exists
+if ! command -v jq >/dev/null 2>&1; then
+  echo "Error: jq is required but not installed." >&2
+  exit 1
+fi
+
+# Find JSON files
+shopt -s nullglob
+files=( "${DATA_DIR}"/*.json )
+
+if [ ${#files[@]} -eq 0 ]; then
+  echo "No JSON files found in ${DATA_DIR}. Run the fetch script first." >&2
+  exit 1
+fi
+
+# Create CSV header
+echo "Name,Height (m),Weight (kg)" > "${OUT}"
+
+# Extract values and append to CSV
+for f in "${files[@]}"; do
+  # Use jq to get name, height (decimeters), weight (hectograms)
+  # Output as tab-separated to avoid comma issues
+  read -r name height_dm weight_hg < <(jq -r '[.name, (.height|tostring), (.weight|tostring)] | @tsv' "$f")
+
+  # Normalize/format:
+  # capitalize name first letter
+  name_cap=$(printf '%s' "$name" | sed -E 's/^([a-z])/\U\1/')
+
+  # Convert units: height dm -> meters, weight hg -> kg
+  # Use awk to compute numeric division and format to 1 decimal place for CSV rows
+  formatted=$(awk -v h="$height_dm" -v w="$weight_hg" 'BEGIN { printf "%.1f\t%.1f", h/10, w/10 }')
+  height_m=$(printf '%s' "$formatted" | cut -f1)
+  weight_kg=$(printf '%s' "$formatted" | cut -f2)
+
+  # Append CSV line (no quotes)
+  printf "%s,%s,%s\n" "$name_cap" "$height_m" "$weight_kg" >> "${OUT}"
+done
+
+echo "CSV Report generated at: ${OUT}"
+echo
+
+# Print CSV content
+cat "${OUT}"
+echo
+
+# Compute averages using awk (skip header)
+# Ensure awk uses numeric values from columns 2 and 3
+awk -F',' 'NR>1 { h+=$2; w+=$3; n++ } END {
+  if (n>0) {
+    printf "\nAverage Height: %.2f m\n", h/n;
+    printf "Average Weight: %.2f kg\n", w/n;
+  } else {
+    print "No data to compute averages."
+  }
+}' "${OUT}"
+
